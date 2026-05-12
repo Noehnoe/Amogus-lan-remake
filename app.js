@@ -441,12 +441,18 @@ function handleLocalDeath(x, y) {
 // ── Emergency meeting helpers (client-side UI / input) ────
 
 function findNearestBody() {
-  if (!MP.enabled) return null;
   let nearest = null, bd = 70;
-  for (const r of MP.remotes.values()) {
-    if (r.alive !== false) continue;
-    const d = Math.hypot(r.x - G.player.x, r.y - G.player.y);
-    if (d < bd) { bd = d; nearest = r; }
+  if (MP.enabled) {
+    for (const r of MP.remotes.values()) {
+      if (r.alive !== false) continue;
+      const d = Math.hypot(r.x - G.player.x, r.y - G.player.y);
+      if (d < bd) { bd = d; nearest = r; }
+    }
+  } else {
+    for (const b of G.bodies) {
+      const d = Math.hypot(b.x - G.player.x, b.y - G.player.y);
+      if (d < bd) { bd = d; nearest = b; }
+    }
   }
   return nearest;
 }
@@ -459,20 +465,154 @@ function nearMeetingButton() {
 // R does double duty: report a body if you're standing on one, otherwise
 // trigger an emergency meeting if you're standing on the cafeteria button.
 function tryReportOrMeeting() {
-  if (!MP.enabled) return;
   if (G.phase !== 'playing') return;
   if (!G.player || !G.player.alive) return;
   if (G.meeting) return;
 
   const body = findNearestBody();
   if (body) {
-    MP.socket.emit('report_body', { victimId: body.id });
+    if (MP.enabled) {
+      MP.socket.emit('report_body', { victimId: body.id });
+    } else {
+      G.bodies = G.bodies.filter(b => b.id !== body.id);
+      startSoloMeeting('player');
+    }
     return;
   }
-  if (MP.meetingUsed) return;
   if (!nearMeetingButton()) return;
-  MP.meetingUsed = true;
-  MP.socket.emit('meeting_call');
+  if (MP.enabled) {
+    if (MP.meetingUsed) return;
+    MP.meetingUsed = true;
+    MP.socket.emit('meeting_call');
+  } else {
+    if (G.soloMeetingUsed) return;
+    G.soloMeetingUsed = true;
+    startSoloMeeting('player');
+  }
+}
+
+// ── Solo meeting system ───────────────────────────────────────
+
+function startSoloMeeting(calledById) {
+  SFX.alarm();
+  flashScreen('white');
+  G.cam.shake = 8;
+
+  // Build player list from alive participants.
+  const players = [];
+  players.push({ id: 'player', name: 'YOU', color: G.player.color });
+  for (const npc of G.npcs) {
+    if (npc.alive) players.push({ id: npc.id, name: npc.name, color: npc.color });
+  }
+
+  G.meeting = {
+    solo: true,
+    calledBy: calledById,
+    players,
+    votes: {},
+    myVote: null,
+    startedAt: performance.now(),
+    duration: 30000,
+    timer: setTimeout(() => endSoloMeeting(), 30000),
+  };
+
+  showMeetingOverlay();
+
+  // Schedule each NPC's vote randomly over the 30s window.
+  for (const npc of G.npcs) {
+    if (!npc.alive) continue;
+    const delay = 2000 + Math.random() * 12000;
+    setTimeout(() => {
+      if (!G.meeting || !G.meeting.solo) return;
+      if (G.meeting.votes[npc.id]) return;
+      // Impostor always votes for a random crewmate.
+      // Crewmates: 40% vote for impostor if they know, else random alive target.
+      const alive = G.meeting.players.filter(p => p.id !== npc.id);
+      const impostor = G.npcs.find(n => n.isImpostor && n.alive);
+      let vote;
+      if (npc.isImpostor) {
+        const targets = alive.filter(p => p.id !== npc.id && p.id !== 'player');
+        vote = targets.length ? targets[Math.floor(Math.random() * targets.length)].id : 'skip';
+      } else {
+        const suspicion = Math.random();
+        if (impostor && suspicion < 0.35) {
+          vote = impostor.id;
+        } else {
+          vote = alive[Math.floor(Math.random() * alive.length)]?.id || 'skip';
+        }
+      }
+      G.meeting.votes[npc.id] = vote;
+      updateMeetingUI();
+      checkAllSoloVoted();
+    }, delay);
+  }
+}
+
+function checkAllSoloVoted() {
+  if (!G.meeting || !G.meeting.solo) return;
+  const alive = G.meeting.players;
+  if (alive.every(p => G.meeting.votes[p.id])) endSoloMeeting();
+}
+
+function castSoloVote(target) {
+  if (!G.meeting || G.meeting.myVote) return;
+  if (!G.player || !G.player.alive) return;
+  G.meeting.myVote = target;
+  G.meeting.votes['player'] = target;
+  updateMeetingUI();
+  SFX.click();
+  checkAllSoloVoted();
+}
+
+function endSoloMeeting() {
+  if (!G.meeting) return;
+  if (G.meeting.timer) clearTimeout(G.meeting.timer);
+
+  // Tally votes.
+  const tally = {};
+  for (const v of Object.values(G.meeting.votes)) {
+    tally[v] = (tally[v] || 0) + 1;
+  }
+  let maxVotes = 0, ejectedId = null, tied = false;
+  for (const [target, count] of Object.entries(tally)) {
+    if (count > maxVotes) { maxVotes = count; ejectedId = target; tied = false; }
+    else if (count === maxVotes) { tied = true; }
+  }
+  if (tied || ejectedId === 'skip' || !ejectedId) ejectedId = null;
+
+  // Apply ejection.
+  let wasImpostor = false;
+  let ejectedPlayer = null;
+  if (ejectedId === 'player') {
+    G.player.alive = false;
+    ejectedPlayer = { name: 'YOU', color: G.player.color };
+  } else if (ejectedId) {
+    const npc = G.npcs.find(n => n.id === ejectedId);
+    if (npc) {
+      npc.alive = false;
+      wasImpostor = npc.isImpostor;
+      ejectedPlayer = { name: npc.name, color: npc.color };
+    }
+  }
+
+  showEjectionReveal(ejectedPlayer, wasImpostor);
+  G.meeting = null;
+
+  setTimeout(() => {
+    document.getElementById('meetingOverlay').classList.add('hidden');
+    document.getElementById('ejectionOverlay').classList.add('hidden');
+    if (wasImpostor) {
+      G.phase = 'won';
+      SFX.win();
+      flashScreen('green');
+      scheduleMenu('win', null, 800);
+    } else if (ejectedId === 'player') {
+      G.phase = 'lost';
+      scheduleMenu('lose', null, 800);
+    } else {
+      checkWinLose();
+    }
+  }, 3200);
 }
 
 function showMeetingOverlay() {
@@ -485,7 +625,7 @@ function showMeetingOverlay() {
   caller.textContent = `called by ${callerPlayer ? callerPlayer.name : '???'}`;
 
   for (const p of G.meeting.players) {
-    const isMe = p.id === MP.selfId;
+    const isMe = G.meeting.solo ? p.id === 'player' : p.id === MP.selfId;
     const isMeAlive = G.player && G.player.alive;
     const btn = document.createElement('button');
     btn.className = 'meeting-player' + (isMe ? ' is-me' : '');
@@ -496,7 +636,7 @@ function showMeetingOverlay() {
       <span class="meeting-player-name">${p.name}</span>
       <span class="meeting-player-vote">VOTE</span>
     `;
-    if (isMeAlive) btn.addEventListener('click', () => castVote(p.id));
+    if (isMeAlive && !isMe) btn.addEventListener('click', () => castVote(p.id));
     list.appendChild(btn);
   }
 
@@ -518,10 +658,14 @@ function showMeetingOverlay() {
 function castVote(target) {
   if (!G.meeting || G.meeting.myVote) return;
   if (!G.player || !G.player.alive) return;
-  G.meeting.myVote = target;
-  MP.socket.emit('vote', { target });
-  updateMeetingUI();
-  SFX.click();
+  if (G.meeting.solo) {
+    castSoloVote(target);
+  } else {
+    G.meeting.myVote = target;
+    MP.socket.emit('vote', { target });
+    updateMeetingUI();
+    SFX.click();
+  }
 }
 
 function updateMeetingUI() {
@@ -740,8 +884,9 @@ const G = {
   killedAt: null,
   pendingMenuTimeout: null,
   meeting: null,             // active meeting state: { calledBy, players, votes, myVote, startedAt, duration }
-  bodies: [],                // [{ playerId, x, y }] reported-able corpses
+  bodies: [],                // [{ id, x, y, name, color }] reportable corpses (solo + MP)
   sabotages: { lights: false, doors: false },  // active booleans — cleared by fix_sabotage
+  soloMeetingUsed: false,    // player's emergency meeting button (solo mode)
 };
 
 // Current solid set — walls always, doors only when door-sabotage is active.
@@ -899,21 +1044,22 @@ function makePlayer(x, y, color) {
   };
 }
 
-function makeNPC(x, y, color, name, isImpostor = false) {
+function makeNPC(x, y, color, name, isImpostor = false, id = '') {
   return {
     type: 'npc',
     x, y, vx: 0, vy: 0,
-    color, name,
+    id, color, name,
     speed: CFG.NPC_SPEED,
     huntSpeed: isImpostor ? CFG.IMPOSTOR_HUNT_SPEED : 0,
     radius: CFG.PLAYER_RADIUS,
     facing: 1,
     walkPhase: 0,
     isImpostor,
-    state: 'wander',     // 'wander' | 'task' | 'hunt' | 'vent'
+    state: 'wander',     // 'wander' | 'hunt' | 'vent'
     target: null,
     taskT: 0,
     killCooldown: isImpostor ? 6 : 0,
+    sabotageT: isImpostor ? 30 : 0,  // time until next sabotage attempt
     huntT: 0,
     ventT: 0,
     alive: true,
@@ -947,10 +1093,12 @@ function initGame() {
     const impostorIdx = Math.floor(Math.random() * positions.length);
 
     for (let i = 0; i < positions.length; i++) {
-      const npc = makeNPC(positions[i].x, positions[i].y, palette[i], names[i], i === impostorIdx);
+      const npc = makeNPC(positions[i].x, positions[i].y, palette[i], names[i], i === impostorIdx, `npc_${i}`);
       G.npcs.push(npc);
     }
   }
+  G.soloMeetingUsed = false;
+  G.bodies = [];
 
   G.tasks = TASK_DEFS.map(t => ({ ...t, done: false, progress: 0 }));
 
@@ -1246,40 +1394,74 @@ function updateCrewmate(npc, dt) {
 function updateImpostor(npc, dt) {
   const p = G.player;
 
-  // can it see/sense the player?
-  const dist = Math.hypot(p.x - npc.x, p.y - npc.y);
-  const sees = dist < CFG.IMPOSTOR_VISION && lineOfSight(npc.x, npc.y, p.x, p.y);
+  // Sabotage timer — periodically trigger a sabotage if none active.
+  npc.sabotageT = Math.max(0, npc.sabotageT - dt);
+  if (npc.sabotageT <= 0 && !G.meeting) {
+    if (!G.sabotages.lights && !G.sabotages.doors) {
+      const type = Math.random() < 0.5 ? 'lights' : 'doors';
+      G.sabotages[type] = true;
+      if (type === 'lights') G.vision.active = false;
+      SFX.alarm();
+      flashScreen('red');
+      G.cam.shake = 8;
+    }
+    npc.sabotageT = 35 + Math.random() * 20;  // next attempt in 35-55s
+  }
 
-  // is player alone? (no other crewmate within 220 of player)
-  let aloneFactor = 1;
+  // Find best hunt target: player or isolated crewmate NPC.
+  let huntTarget = null, huntDist = Infinity;
+  if (p.alive && npc.killCooldown <= 0) {
+    const d = Math.hypot(p.x - npc.x, p.y - npc.y);
+    let alone = true;
+    for (const other of G.npcs) {
+      if (other === npc || !other.alive || other.isImpostor) continue;
+      if (Math.hypot(other.x - p.x, other.y - p.y) < 240) { alone = false; break; }
+    }
+    if (alone && d < CFG.IMPOSTOR_VISION && lineOfSight(npc.x, npc.y, p.x, p.y)) {
+      huntTarget = p; huntDist = d;
+    }
+  }
+  // Also consider killing isolated crewmate NPCs.
   for (const other of G.npcs) {
-    if (other === npc || !other.alive || other.isImpostor) continue;
-    if (Math.hypot(other.x - p.x, other.y - p.y) < 240) {
-      aloneFactor = 0;
-      break;
+    if (!other.alive || other.isImpostor || npc.killCooldown > 0) continue;
+    const d = Math.hypot(other.x - npc.x, other.y - npc.y);
+    if (d < CFG.IMPOSTOR_VISION && d < huntDist && lineOfSight(npc.x, npc.y, other.x, other.y)) {
+      let alone = true;
+      for (const w of G.npcs) {
+        if (w === npc || w === other || !w.alive || w.isImpostor) continue;
+        if (Math.hypot(w.x - other.x, w.y - other.y) < 200) { alone = false; break; }
+      }
+      if (alone) { huntTarget = other; huntDist = d; }
     }
   }
 
-  if (sees && aloneFactor === 1 && p.alive) {
+  if (huntTarget) {
     npc.state = 'hunt';
+    npc.huntTarget = huntTarget;
     npc.huntT = 4;
   } else if (npc.huntT > 0) {
     npc.huntT -= dt;
-    if (npc.huntT <= 0) npc.state = 'wander';
+    if (npc.huntT <= 0) { npc.state = 'wander'; npc.huntTarget = null; }
   }
 
-  if (npc.state === 'hunt') {
-    // chase the player
-    const dx = p.x - npc.x;
-    const dy = p.y - npc.y;
+  if (npc.state === 'hunt' && npc.huntTarget) {
+    const target = npc.huntTarget;
+    const dx = target.x - npc.x;
+    const dy = target.y - npc.y;
     const d = Math.hypot(dx, dy) || 1;
     npc.vx = (dx / d) * npc.huntSpeed;
     npc.vy = (dy / d) * npc.huntSpeed;
     moveWithCollision(npc, npc.vx * dt, npc.vy * dt);
 
-    // attempt kill
-    if (dist < CFG.KILL_RANGE && npc.killCooldown <= 0) {
-      killPlayer();
+    if (d < CFG.KILL_RANGE && npc.killCooldown <= 0) {
+      if (target === p) {
+        killPlayer();
+      } else {
+        killNPC(target, npc);
+      }
+      npc.killCooldown = 25;
+      npc.state = 'wander';
+      npc.huntTarget = null;
     }
 
     // menacing trail
@@ -1349,6 +1531,23 @@ function killPlayer() {
 
   G.phase = 'lost';
   scheduleMenu('lose', null, 1500);
+}
+
+function killNPC(npc, killer) {
+  if (!npc.alive) return;
+  npc.alive = false;
+  for (let i = 0; i < 20; i++) {
+    spawnParticle(npc.x, npc.y, {
+      vx: (Math.random() - 0.5) * 200,
+      vy: (Math.random() - 0.5) * 200,
+      life: 1 + Math.random() * 0.5,
+      size: 2 + Math.random() * 3,
+      color: '#9b1d28', gravity: 180, drag: 0.95,
+    });
+  }
+  G.bloodSplats.push({ x: npc.x, y: npc.y });
+  G.bodies.push({ id: npc.id, x: npc.x, y: npc.y, name: npc.name, color: npc.color });
+  SFX.kill();
 }
 
 function updateParticles(dt) {
@@ -1422,16 +1621,20 @@ function updateInteractionPrompt() {
   if (!G.player.alive)     { setPrompt(''); return; }
   if (G.meeting)           { setPrompt(''); return; }
 
-  // Body report — highest priority. Both impostor and crewmate can do this.
-  if (MP.enabled) {
+  // Body report — highest priority for crewmates.
+  {
     const body = findNearestBody();
     if (body) {
       setPrompt(`PRESS [R] — REPORT BODY (${body.name || '???'})`, true);
       return;
     }
-    // Battery console — crewmate only, when a sabotage is active.
+  }
+
+  // Battery console — crewmate only, when a sabotage is active.
+  {
     const anyActive = G.sabotages.lights || G.sabotages.doors;
-    if (anyActive && MP.role !== 'impostor') {
+    const isImpostor = MP.enabled && MP.role === 'impostor';
+    if (anyActive && !isImpostor) {
       const bc = BATTERY_CONSOLE;
       if (Math.hypot(bc.x - G.player.x, bc.y - G.player.y) < 60) {
         const which = G.sabotages.lights ? 'LIGHTS' : 'DOORS';
@@ -1439,12 +1642,18 @@ function updateInteractionPrompt() {
         return;
       }
     }
-    // Meeting button (proximity).
-    if (nearMeetingButton()) {
+  }
+
+  // Meeting button (proximity).
+  if (nearMeetingButton()) {
+    if (MP.enabled) {
       if (MP.meetingUsed) setPrompt('MEETING ALREADY USED');
       else                setPrompt('PRESS [R] — EMERGENCY MEETING', true);
-      return;
+    } else {
+      if (G.soloMeetingUsed) setPrompt('MEETING ALREADY USED');
+      else                   setPrompt('PRESS [R] — EMERGENCY MEETING', true);
     }
+    return;
   }
 
   // Impostor: kill prompt.
@@ -1475,11 +1684,35 @@ function updateInteractionPrompt() {
 function checkWinLose() {
   // In MP mode the server is authoritative — it emits 'game_over'.
   if (MP.enabled) return;
+  if (G.phase !== 'playing') return;
+
+  const impostor = G.npcs.find(n => n.isImpostor);
+
+  // Crew wins: impostor is dead.
+  if (impostor && !impostor.alive) {
+    G.phase = 'won';
+    SFX.win();
+    flashScreen('green');
+    scheduleMenu('win', null, 800);
+    return;
+  }
+
+  // Crew wins: all tasks done.
   if (G.tasks.every(t => t.done)) {
     G.phase = 'won';
     SFX.win();
     flashScreen('green');
     scheduleMenu('win', null, 800);
+    return;
+  }
+
+  // Impostor wins: player dead AND all crewmate NPCs dead.
+  if (!G.player.alive) {
+    const aliveCrew = G.npcs.filter(n => !n.isImpostor && n.alive);
+    if (aliveCrew.length === 0) {
+      G.phase = 'lost';
+      scheduleMenu('lose', null, 800);
+    }
   }
 }
 
@@ -1755,9 +1988,8 @@ function renderTasks() {
 }
 
 function renderMeetingButton() {
-  if (!MP.enabled) return;
   const mb = MEETING_BUTTON;
-  const used = MP.meetingUsed;
+  const used = MP.enabled ? MP.meetingUsed : G.soloMeetingUsed;
   const pulse = (Math.sin(G.pulseT * 2.5) + 1) / 2;
 
   // Ground glow.
@@ -2375,10 +2607,19 @@ function tryInteract() {
 
   // Battery console — crewmates only, fixes any active sabotage.
   const anyActive = G.sabotages.lights || G.sabotages.doors;
-  if (anyActive && MP.enabled && MP.role !== 'impostor') {
+  const isImpostor = MP.enabled && MP.role === 'impostor';
+  if (anyActive && !isImpostor) {
     const bc = BATTERY_CONSOLE;
     if (Math.hypot(bc.x - G.player.x, bc.y - G.player.y) < 60) {
-      MP.socket.emit('fix_sabotage');
+      if (MP.enabled) {
+        MP.socket.emit('fix_sabotage');
+      } else {
+        // Solo mode: fix locally.
+        G.sabotages.lights = false;
+        G.sabotages.doors  = false;
+        flashScreen('white');
+        G.cam.shake = 4;
+      }
       return;
     }
   }
@@ -2777,6 +3018,8 @@ function startLocalRound() {
   initGame();
   buildHUD();
   sweep(110, 440, 0.6, 'sawtooth', 0.04);
+  // In solo mode always show crewmate role banner.
+  if (!MP.enabled) showRoleBanner('crewmate');
 }
 
 // In multiplayer, hide the BOOT SEQUENCE button for non-hosts and show a

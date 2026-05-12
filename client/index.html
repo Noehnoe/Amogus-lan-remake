@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Voidship</title>
+  <style>
+    /* ── Reset & base ─────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0a0a1a;
+      color: #e0e0f0;
+      font-family: 'Courier New', monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Screens ──────────────────────────────────────────────────── */
+    .screen { display: none; width: 100%; max-width: 900px; padding: 20px; }
+    .screen.active { display: flex; flex-direction: column; align-items: center; }
+
+    /* ── Game canvas (hidden until Phase 3) ─────────────────────── */
+    #gameCanvas {
+      display: none;
+      border: 2px solid #333;
+      background: #111;
+    }
+
+    /* ── Lobby / phase-1 echo test UI ───────────────────────────── */
+    h1 {
+      font-size: 3rem;
+      letter-spacing: 0.15em;
+      color: #7fdbff;
+      text-shadow: 0 0 20px #7fdbff88;
+      margin-bottom: 6px;
+    }
+    .tagline { color: #556; font-size: 0.85rem; margin-bottom: 40px; }
+
+    .card {
+      background: #13132a;
+      border: 1px solid #2a2a4a;
+      border-radius: 8px;
+      padding: 24px 32px;
+      width: 100%;
+      max-width: 520px;
+      margin-bottom: 20px;
+    }
+    .card h2 { color: #7fdbff; margin-bottom: 16px; font-size: 1rem; letter-spacing: 0.1em; }
+
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #444; flex-shrink: 0;
+      transition: background 0.3s;
+    }
+    .dot.green  { background: #2ecc71; box-shadow: 0 0 6px #2ecc71; }
+    .dot.red    { background: #e74c3c; box-shadow: 0 0 6px #e74c3c; }
+    .dot.yellow { background: #f39c12; box-shadow: 0 0 6px #f39c12; }
+
+    button {
+      background: #1a1a3a;
+      color: #7fdbff;
+      border: 1px solid #7fdbff55;
+      border-radius: 6px;
+      padding: 10px 22px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.9rem;
+      letter-spacing: 0.05em;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    button:hover { background: #222244; border-color: #7fdbff; }
+    button:disabled { opacity: 0.35; cursor: not-allowed; }
+
+    #echoLog {
+      background: #0a0a18;
+      border: 1px solid #1a1a3a;
+      border-radius: 4px;
+      padding: 10px;
+      height: 120px;
+      overflow-y: auto;
+      font-size: 0.78rem;
+      color: #7fbfff;
+      margin-top: 12px;
+    }
+    #echoLog .entry { margin-bottom: 4px; }
+    #echoLog .entry .ts { color: #444; margin-right: 6px; }
+    #echoLog .entry.recv { color: #2ecc71; }
+    #echoLog .entry.sent { color: #f39c12; }
+    #echoLog .entry.err  { color: #e74c3c; }
+
+    /* ── Lobby screen (Phase 2+) ──────────────────────────────────── */
+    #lobbyScreen { gap: 16px; }
+
+    /* ── Utility ──────────────────────────────────────────────────── */
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    input[type="text"] {
+      background: #0d0d22;
+      border: 1px solid #2a2a4a;
+      border-radius: 6px;
+      color: #e0e0f0;
+      font-family: inherit;
+      font-size: 0.9rem;
+      padding: 8px 12px;
+    }
+    input[type="text"]:focus { outline: none; border-color: #7fdbff55; }
+  </style>
+</head>
+<body>
+
+  <!-- ── Phase 1: Connection / Echo test screen ─────────────────── -->
+  <div id="connectScreen" class="screen active">
+    <h1>VOIDSHIP</h1>
+    <p class="tagline">a social deduction game for 4–10 players on your local network</p>
+
+    <div class="card">
+      <h2>SERVER CONNECTION</h2>
+      <div class="status-row">
+        <div class="dot" id="connDot"></div>
+        <span id="connStatus">Connecting…</span>
+      </div>
+      <div class="status-row" style="margin-top:16px;">
+        <button id="pingBtn" disabled>Send Echo Ping</button>
+        <span style="font-size:0.8rem; color:#556;">— tests round-trip to server</span>
+      </div>
+      <div id="echoLog"><div class="entry" style="color:#444;">Waiting for connection…</div></div>
+    </div>
+
+    <div class="card">
+      <h2>HOW TO PLAY ON LAN</h2>
+      <p style="font-size:0.82rem; line-height:1.7; color:#889;">
+        1. The host runs <code style="color:#7fdbff;">npm start</code> — the server prints its LAN IP.<br>
+        2. Other players open <code style="color:#7fdbff;">http://&lt;host-ip&gt;:3000</code> in a browser.<br>
+        3. Once ≥4 players join, the host can start the game.<br>
+        <br>
+        <em>Phase 1 — echo test only. Lobby and game coming in Phase 2+.</em>
+      </p>
+    </div>
+  </div>
+
+  <!-- ── Phase 2+: Lobby screen (hidden for now) ────────────────── -->
+  <div id="lobbyScreen" class="screen">
+    <h1>VOIDSHIP</h1>
+    <!-- populated by ui.js in Phase 2 -->
+  </div>
+
+  <!-- ── Phase 3+: Game canvas (hidden for now) ────────────────── -->
+  <canvas id="gameCanvas" width="1200" height="800"></canvas>
+
+  <!-- ── Scripts ─────────────────────────────────────────────────── -->
+  <!-- Socket.IO client — served automatically by the socket.io package -->
+  <script src="/socket.io/socket.io.js"></script>
+  <!-- Shared constants (same file used by server) -->
+  <script src="/shared/constants.js"></script>
+  <!-- Game client modules -->
+  <script src="/main.js"></script>
+  <script src="/render.js"></script>
+  <script src="/ui.js"></script>
+</body>
+</html>

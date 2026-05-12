@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VOIDSHIP — Solo Drift</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Main game canvas -->
+  <canvas id="game"></canvas>
+
+  <!-- Subtle CRT / scanline overlay -->
+  <div class="scanlines"></div>
+  <div class="vignette"></div>
+  <div class="flash" id="flash"></div>
+
+  <!-- Impostor kill cooldown HUD (shown only when local player is impostor) -->
+  <div id="killIndicator" class="kill-indicator">
+    <div class="label">KILL</div>
+    <div class="value" id="killValue">READY</div>
+  </div>
+
+  <!-- HUD overlay -->
+  <div id="hud" class="hud hidden">
+    <div class="hud-top">
+      <div class="hud-card" id="taskCard">
+        <div class="hud-label">SHIP SYSTEMS</div>
+        <div class="task-list" id="taskList"></div>
+        <div class="progress-track">
+          <div class="progress-fill" id="progressFill"></div>
+          <div class="progress-text" id="progressText">0%</div>
+        </div>
+      </div>
+      <div class="hud-card hud-center">
+        <div class="hud-label">DRIFT TIME</div>
+        <div class="hud-clock" id="clock">00:00</div>
+        <div class="hud-sublabel" id="threat">SECTOR CLEAR</div>
+      </div>
+      <div class="hud-card hud-right">
+        <div class="hud-label">MINIMAP</div>
+        <canvas id="minimap" width="180" height="135"></canvas>
+      </div>
+    </div>
+
+    <div class="hud-bottom">
+      <div class="hud-prompt" id="prompt"></div>
+      <button id="meetingBtn" class="meeting-btn" title="Call emergency meeting (R)">
+        <span class="meeting-btn-icon">!</span>
+        <span class="meeting-btn-label">MEETING</span>
+      </button>
+      <div class="hud-controls">
+        <span class="key">WASD</span> move
+        <span class="key">E</span> interact
+        <span class="key">R</span> meeting
+        <span class="key">SHIFT</span> sprint
+        <span class="key">F</span> flashlight
+      </div>
+    </div>
+  </div>
+
+  <!-- Task panel (popup when interacting) -->
+  <div id="taskPanel" class="task-panel hidden">
+    <div class="task-panel-inner">
+      <div class="task-title" id="taskPanelTitle">SYSTEM</div>
+      <div id="taskPanelBody"></div>
+      <button id="taskCancel" class="ghost-btn">CANCEL</button>
+    </div>
+  </div>
+
+  <!-- Emergency meeting overlay -->
+  <div id="meetingOverlay" class="meeting-overlay hidden">
+    <div class="meeting-card">
+      <div class="meeting-header">
+        <div class="meeting-title">EMERGENCY MEETING</div>
+        <div class="meeting-caller" id="meetingCaller"></div>
+      </div>
+      <div class="meeting-timer-row">
+        <div class="meeting-timer-label">VOTING ENDS IN</div>
+        <div class="meeting-timer" id="meetingTimer">30</div>
+      </div>
+      <div class="meeting-players" id="meetingPlayers"></div>
+      <button class="meeting-skip" id="skipVoteBtn">SKIP VOTE</button>
+      <div class="meeting-status" id="meetingStatus"></div>
+    </div>
+  </div>
+
+  <!-- Ejection reveal overlay -->
+  <div id="ejectionOverlay" class="ejection-overlay hidden">
+    <div class="ejection-text" id="ejectionText"></div>
+  </div>
+
+  <!-- Role reveal banner shown for ~3s at the start of an MP round -->
+  <div id="roleBanner" class="role-banner hidden">
+    <div class="role-banner-inner">
+      <div class="role-label">YOU ARE</div>
+      <div class="role-name" id="roleName">CREWMATE</div>
+      <div class="role-desc" id="roleDesc">complete tasks · stay alive</div>
+    </div>
+  </div>
+
+  <!-- Start / death / win screens -->
+  <div id="menu" class="menu">
+    <div class="menu-stars"></div>
+    <h1 class="title">VOIDSHIP</h1>
+    <p class="subtitle">— solo drift —</p>
+    <p class="brief" id="menuBrief">
+      Your ship is dead. Restart six systems before the thing in the vents finds you alone.<br>
+      Stay near other crew. The dark is not your friend.
+    </p>
+    <button id="startBtn" class="big-btn">BOOT SEQUENCE</button>
+    <div id="mpStatus" class="mp-status" style="display:none;"></div>
+    <div class="menu-footer">
+      <span class="key">WASD</span> move · <span class="key">E</span> interact · <span class="key">SHIFT</span> sprint · <span class="key">F</span> flashlight
+    </div>
+  </div>
+
+  <!-- Socket.IO is only available when this page is served by the Node server.
+       If opened as a local file, the request 404s silently and the game runs
+       single-player. -->
+  <script src="/socket.io/socket.io.js" onerror="window.__NO_SOCKETIO=true"></script>
+  <script src="app.js"></script>
+</body>
+</html>

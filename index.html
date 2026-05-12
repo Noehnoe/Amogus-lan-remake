@@ -22,6 +22,21 @@
     <div class="value" id="killValue">READY</div>
   </div>
 
+  <!-- Impostor sabotage HUD (shown only when local player is impostor) -->
+  <div id="sabotagePanel" class="sabotage-panel" style="display:none">
+    <div class="sabotage-title">SABOTAGE</div>
+    <button class="sab-btn" data-type="lights">
+      <span class="sab-icon">⚡</span>
+      <span class="sab-label">LIGHTS</span>
+      <span class="sab-status" data-status="lights">READY</span>
+    </button>
+    <button class="sab-btn" data-type="doors">
+      <span class="sab-icon">⊟</span>
+      <span class="sab-label">DOORS</span>
+      <span class="sab-status" data-status="doors">READY</span>
+    </button>
+  </div>
+
   <!-- HUD overlay -->
   <div id="hud" class="hud hidden">
     <div class="hud-top">

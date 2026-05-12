@@ -57,10 +57,13 @@ const ROOMS = [
   { id: 'security',   name: 'SECURITY',    x: 1380, y: 820, w: 360, h: 240, tint: '#1a2a3a' },
 ];
 
-// Walls = rectangles (axis-aligned, easy collision)
-// Built from room outlines minus doorway gaps.
-function buildWalls() {
+// Build walls + door rects. Walls are always-impassable rectangles. Doors
+// are the gaps between rooms — passable normally, but become impassable
+// during a door-sabotage. Both share the same { x, y, w, h } shape so they
+// can be appended together when sabotage is active.
+function buildMap() {
   const walls = [];
+  const doors = [];
   const t = 8; // wall thickness
 
   // outer hull
@@ -69,7 +72,6 @@ function buildWalls() {
   walls.push({ x: 40,  y: 40,  w: t, h: CFG.MAP_H - 80 });           // left
   walls.push({ x: CFG.MAP_W - 48, y: 40, w: t, h: CFG.MAP_H - 80 }); // right
 
-  // Helper to outline a room with optional door gaps.
   // gaps = array of {side:'top'|'bottom'|'left'|'right', start, length}
   function room(r, gaps = []) {
     const sides = [
@@ -81,13 +83,15 @@ function buildWalls() {
     for (const s of sides) {
       const gap = gaps.find(g => g.side === s.side);
       if (!gap) { walls.push(s); continue; }
-      // split into two segments around the gap
+      // Record the door's rectangle.
       if (s.side === 'top' || s.side === 'bottom') {
+        doors.push({ x: gap.start, y: s.y, w: gap.length, h: t, side: s.side });
         if (gap.start - s.x > 0) walls.push({ ...s, w: gap.start - s.x });
         const right = s.x + s.w;
         const after = gap.start + gap.length;
         if (right - after > 0) walls.push({ ...s, x: after, w: right - after });
       } else {
+        doors.push({ x: s.x, y: gap.start, w: t, h: gap.length, side: s.side });
         if (gap.start - s.y > 0) walls.push({ ...s, h: gap.start - s.y });
         const bot = s.y + s.h;
         const after = gap.start + gap.length;
@@ -132,16 +136,28 @@ function buildWalls() {
     { side: 'top',    start: 1450, length: 100 },
   ]);
 
-  return walls;
+  return { walls, doors };
 }
 
-const WALLS = buildWalls();
+const _map = buildMap();
+const WALLS = _map.walls;
+const DOORS = _map.doors;
 
+// Position of the in-world emergency-meeting button (center of cafeteria).
+const MEETING_BUTTON = { x: 1000, y: 510, r: 28 };
+
+// Vents — placed in room corners so impostor can escape stealthily.
+// Linked pairs: 0↔1 (engineering↔reactor), 2↔3 (medbay↔security),
+//               4↔5 (bridge↔storage),     6↔7 (cafeteria↔comms).
 const VENTS = [
-  { x: 180,  y: 470, link: 1 },  // engineering
-  { x: 1000, y: 920, link: 0 },  // reactor  (paired with engineering)
-  { x: 1620, y: 870, link: 3 },  // security
-  { x: 1620, y: 220, link: 2 },  // medbay   (paired with security)
+  { x: 110,  y: 590, link: 1 },  // engineering bottom-left corner
+  { x: 800,  y: 1000, link: 0 }, // reactor bottom-left corner
+  { x: 1750, y: 120, link: 3 },  // medbay top-right corner
+  { x: 1700, y: 1020, link: 2 }, // security bottom-right corner
+  { x: 750,  y: 100, link: 5 },  // bridge top-left corner
+  { x: 240,  y: 990, link: 4 },  // storage bottom-left corner
+  { x: 1260, y: 600, link: 7 },  // cafeteria bottom-right corner
+  { x: 1760, y: 700, link: 6 },  // comms bottom-right corner
 ];
 
 const TASK_DEFS = [
@@ -325,6 +341,28 @@ function initMultiplayer() {
     if (r) r.name = name;
   });
 
+  // ── Sabotage (impostor calls; everyone sees the effect) ─
+  MP.socket.on('sabotage_start', ({ type, duration }) => {
+    const endsAt = performance.now() + duration;
+    G.sabotages[type] = endsAt;
+    if (type === 'lights') {
+      G.ambient.lightsOut = true;
+      G.ambient.lightsOutT = duration / 1000;
+    }
+    SFX.alarm();
+    flashScreen('red');
+    G.cam.shake = 10;
+  });
+
+  MP.socket.on('sabotage_end', ({ type }) => {
+    G.sabotages[type] = 0;
+    if (type === 'lights') {
+      G.ambient.lightsOut = false;
+      G.ambient.lightsOutT = 0;
+      flashScreen('white');
+    }
+  });
+
   MP.socket.on('killed', ({ victimId, x, y }) => {
     if (victimId === MP.selfId) {
       handleLocalDeath(x, y);
@@ -400,13 +438,38 @@ function handleLocalDeath(x, y) {
 
 // ── Emergency meeting helpers (client-side UI / input) ────
 
-function tryCallMeeting() {
+function findNearestBody() {
+  if (!MP.enabled) return null;
+  let nearest = null, bd = 70;
+  for (const r of MP.remotes.values()) {
+    if (r.alive !== false) continue;
+    const d = Math.hypot(r.x - G.player.x, r.y - G.player.y);
+    if (d < bd) { bd = d; nearest = r; }
+  }
+  return nearest;
+}
+
+function nearMeetingButton() {
+  const mb = MEETING_BUTTON;
+  return Math.hypot(mb.x - G.player.x, mb.y - G.player.y) < 70;
+}
+
+// R does double duty: report a body if you're standing on one, otherwise
+// trigger an emergency meeting if you're standing on the cafeteria button.
+function tryReportOrMeeting() {
   if (!MP.enabled) return;
   if (G.phase !== 'playing') return;
   if (!G.player || !G.player.alive) return;
   if (G.meeting) return;
-  if (MP.meetingUsed) return;       // 1 per round per player
-  MP.meetingUsed = true;            // optimistic — server enforces too
+
+  const body = findNearestBody();
+  if (body) {
+    MP.socket.emit('report_body', { victimId: body.id });
+    return;
+  }
+  if (MP.meetingUsed) return;
+  if (!nearMeetingButton()) return;
+  MP.meetingUsed = true;
   MP.socket.emit('meeting_call');
 }
 
@@ -675,7 +738,17 @@ const G = {
   killedAt: null,
   pendingMenuTimeout: null,
   meeting: null,             // active meeting state: { calledBy, players, votes, myVote, startedAt, duration }
+  bodies: [],                // [{ playerId, x, y }] reported-able corpses
+  sabotages: { lights: 0, doors: 0 },  // expiry timestamps (ms via performance.now)
 };
+
+// Current solid set — walls always, doors only when door-sabotage is active.
+function solids() {
+  if (G.sabotages.doors > performance.now()) {
+    return WALLS.concat(DOORS);
+  }
+  return WALLS;
+}
 
 // Schedule the post-game menu to appear after `delay` ms. If a new round
 // starts before it fires (e.g. host pressed BOOT), the timeout is cancelled
@@ -700,13 +773,12 @@ function cancelPendingMenu() {
 
 const keys = {};
 window.addEventListener('keydown', e => {
-  // Don't hijack typing in inputs (name field, etc).
   if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
   keys[e.key.toLowerCase()] = true;
   if (e.key === 'e' || e.key === 'E') tryInteract();
   if (e.key === 'f' || e.key === 'F') G.vision.active = !G.vision.active;
   if (e.key === 'q' || e.key === 'Q') tryKill();
-  if (e.key === 'r' || e.key === 'R') tryCallMeeting();
+  if (e.key === 'r' || e.key === 'R') tryReportOrMeeting();
 });
 window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
@@ -766,15 +838,43 @@ function noise(dur = 0.2, vol = 0.04) {
   src.start();
 }
 
+// HTML5 audio sources for the recorded clips in /SFX. Loaded once and
+// rewound on each play so they can fire rapidly without garbage churn.
+const SFX_AUDIO = {
+  meeting:  null,
+  task:     null,
+  taskOpen: null,
+  walk:     null,
+};
+(function loadSfx() {
+  try {
+    const base = '/SFX/';
+    SFX_AUDIO.meeting  = new Audio(base + 'Meeting.mp3');
+    SFX_AUDIO.task     = new Audio(base + 'Task.mp3');
+    SFX_AUDIO.taskOpen = new Audio(base + 'TaskOpen.mp3');
+    SFX_AUDIO.walk     = new Audio(base + 'Walk.mp3');
+    for (const k in SFX_AUDIO) { if (SFX_AUDIO[k]) SFX_AUDIO[k].volume = 0.65; }
+  } catch (e) { /* file:// or no audio */ }
+})();
+function playClip(name, vol) {
+  const a = SFX_AUDIO[name]; if (!a) return;
+  try {
+    const node = a.cloneNode();
+    node.volume = vol == null ? a.volume : vol;
+    node.play().catch(() => {});
+  } catch (e) { /* ignore */ }
+}
+
 const SFX = {
+  // Procedural fallbacks; recorded clips used when available.
   step:    () => blip(180 + Math.random() * 40, 0.04, 'triangle', 0.025),
-  taskOk:  () => { blip(880, 0.08, 'sine', 0.08); setTimeout(() => blip(1320, 0.12, 'sine', 0.08), 70); },
+  taskOk:  () => { if (SFX_AUDIO.task) playClip('task'); else { blip(880, 0.08, 'sine', 0.08); setTimeout(() => blip(1320, 0.12, 'sine', 0.08), 70); } },
   taskBad: () => { blip(220, 0.12, 'square', 0.06); },
-  taskOpen:() => sweep(220, 660, 0.18, 'sine', 0.06),
+  taskOpen:() => { if (SFX_AUDIO.taskOpen) playClip('taskOpen'); else sweep(220, 660, 0.18, 'sine', 0.06); },
   taskClose: () => sweep(660, 220, 0.14, 'sine', 0.05),
   kill:    () => { sweep(660, 60, 0.5, 'sawtooth', 0.12); noise(0.3, 0.06); },
   vent:    () => { sweep(120, 60, 0.3, 'sine', 0.05); noise(0.15, 0.03); },
-  alarm:   () => { sweep(440, 880, 0.18, 'sawtooth', 0.05); setTimeout(() => sweep(880, 440, 0.18, 'sawtooth', 0.05), 200); },
+  alarm:   () => { if (SFX_AUDIO.meeting) playClip('meeting'); else { sweep(440, 880, 0.18, 'sawtooth', 0.05); setTimeout(() => sweep(880, 440, 0.18, 'sawtooth', 0.05), 200); } },
   win:     () => { blip(523, 0.15, 'sine', 0.08); setTimeout(() => blip(659, 0.15, 'sine', 0.08), 150); setTimeout(() => blip(784, 0.3, 'sine', 0.1), 300); },
   click:   () => blip(700, 0.04, 'square', 0.03),
 };
@@ -879,6 +979,7 @@ function initGame() {
   G.ambient.lightsOutT = 0;
   G.threatLevel = 0;
   G.killedAt = null;
+  G.sabotages = { lights: 0, doors: 0 };
 
   // Background stars
   G.stars = [];
@@ -923,35 +1024,34 @@ function circleVsRect(cx, cy, cr, rx, ry, rw, rh) {
 }
 
 function moveWithCollision(entity, dx, dy) {
-  // try X, then Y, separately so we slide along walls
+  const cols = solids();
   let nx = entity.x + dx;
   let ny = entity.y + dy;
 
   let blockedX = false, blockedY = false;
-  for (const w of WALLS) {
+  for (const w of cols) {
     if (circleVsRect(nx, entity.y, entity.radius, w.x, w.y, w.w, w.h)) { blockedX = true; break; }
   }
   if (!blockedX) entity.x = nx;
 
-  for (const w of WALLS) {
+  for (const w of cols) {
     if (circleVsRect(entity.x, ny, entity.radius, w.x, w.y, w.w, w.h)) { blockedY = true; break; }
   }
   if (!blockedY) entity.y = ny;
 
-  // clamp to map
   entity.x = Math.max(60, Math.min(CFG.MAP_W - 60, entity.x));
   entity.y = Math.max(60, Math.min(CFG.MAP_H - 60, entity.y));
 }
 
-// line-of-sight: walk a coarse ray and check wall hits
 function lineOfSight(x1, y1, x2, y2) {
+  const cols = solids();
   const dx = x2 - x1, dy = y2 - y1;
   const dist = Math.hypot(dx, dy);
-  const steps = Math.ceil(dist / 16);
+  const steps = Math.ceil(dist / 12);
   for (let i = 1; i < steps; i++) {
     const t = i / steps;
     const x = x1 + dx * t, y = y1 + dy * t;
-    for (const w of WALLS) {
+    for (const w of cols) {
       if (x >= w.x && x <= w.x + w.w && y >= w.y && y <= w.y + w.h) return false;
     }
   }
@@ -1020,6 +1120,7 @@ function update(dt) {
   updateInteractionPrompt();
   updateKillIndicator();
   updateMeetingButton();
+  updateSabotagePanel();
   checkWinLose();
   updateHUD();
 }
@@ -1315,10 +1416,26 @@ function updateCamera(dt) {
 }
 
 function updateInteractionPrompt() {
-  if (G.activeTask) { setPrompt(''); return; }
-  if (!G.player.alive) { setPrompt(''); return; }
+  if (G.activeTask)        { setPrompt(''); return; }
+  if (!G.player.alive)     { setPrompt(''); return; }
+  if (G.meeting)           { setPrompt(''); return; }
 
-  // Impostor: show kill prompt when a crewmate is in range and cooldown is ready.
+  // Body report — highest priority. Both impostor and crewmate can do this.
+  if (MP.enabled) {
+    const body = findNearestBody();
+    if (body) {
+      setPrompt(`PRESS [R] — REPORT BODY (${body.name || '???'})`, true);
+      return;
+    }
+    // Meeting button (proximity).
+    if (nearMeetingButton()) {
+      if (MP.meetingUsed) setPrompt('MEETING ALREADY USED');
+      else                setPrompt('PRESS [R] — EMERGENCY MEETING', true);
+      return;
+    }
+  }
+
+  // Impostor: kill prompt.
   if (MP.enabled && MP.role === 'impostor') {
     if (MP.killCooldown > 0) { setPrompt(''); return; }
     let nearVictim = null, bd = MP.KILL_RANGE;
@@ -1339,11 +1456,8 @@ function updateInteractionPrompt() {
     const d = Math.hypot(t.x - G.player.x, t.y - G.player.y);
     if (d < bd) { bd = d; near = t; }
   }
-  if (near) {
-    setPrompt(`PRESS [E] — ${near.name}`);
-  } else {
-    setPrompt('');
-  }
+  if (near) setPrompt(`PRESS [E] — ${near.name}`);
+  else      setPrompt('');
 }
 
 function checkWinLose() {
@@ -1433,8 +1547,10 @@ function render() {
   renderRoomLabels();
   renderVents();
   renderTasks();
+  renderMeetingButton();
   renderBloodSplats();
   renderWalls();
+  renderClosedDoors();
   renderEntities();
   renderParticles();
   renderPulses();
@@ -1625,6 +1741,75 @@ function renderTasks() {
   }
 }
 
+function renderMeetingButton() {
+  if (!MP.enabled) return;
+  const mb = MEETING_BUTTON;
+  const used = MP.meetingUsed;
+  const pulse = (Math.sin(G.pulseT * 2.5) + 1) / 2;
+
+  // Ground glow.
+  const g = ctx.createRadialGradient(mb.x, mb.y, 0, mb.x, mb.y, 90 + pulse * 10);
+  if (used) {
+    g.addColorStop(0, 'rgba(120, 120, 120, 0.25)');
+  } else {
+    g.addColorStop(0, `rgba(255, 77, 90, ${0.5 + pulse * 0.3})`);
+  }
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(mb.x - 90, mb.y - 90, 180, 180);
+
+  // Pedestal ring.
+  ctx.fillStyle = '#15102a';
+  ctx.beginPath();
+  ctx.arc(mb.x, mb.y, mb.r + 8, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = used ? '#555' : '#ff4d5a';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  // Button face with radial shading.
+  const face = ctx.createRadialGradient(mb.x - 6, mb.y - 6, 0, mb.x, mb.y, mb.r);
+  if (used) {
+    face.addColorStop(0, '#888'); face.addColorStop(1, '#444');
+  } else {
+    face.addColorStop(0, '#ff8090'); face.addColorStop(1, '#cc1a2a');
+  }
+  ctx.fillStyle = face;
+  ctx.beginPath();
+  ctx.arc(mb.x, mb.y, mb.r, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Exclamation.
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 32px Courier New';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('!', mb.x, mb.y + 2);
+
+  // Label.
+  ctx.font = 'bold 11px Courier New';
+  ctx.fillStyle = used ? 'rgba(120, 120, 120, 0.7)' : 'rgba(255, 77, 90, 0.95)';
+  ctx.fillText('EMERGENCY', mb.x, mb.y + mb.r + 16);
+}
+
+function renderClosedDoors() {
+  if (G.sabotages.doors <= performance.now()) return;
+  const remaining = (G.sabotages.doors - performance.now()) / 1000;
+  const flash = Math.sin(performance.now() / 100) > 0;
+  for (const d of DOORS) {
+    // Solid red bar with optional yellow safety stripes when about to lift.
+    ctx.fillStyle = remaining < 3 && flash ? '#ff6b30' : '#cc1a2a';
+    ctx.fillRect(d.x, d.y, d.w, d.h);
+    // Highlight edge.
+    ctx.fillStyle = '#ff4d5a';
+    if (d.h === 8) {
+      ctx.fillRect(d.x, d.y, d.w, 2);
+    } else {
+      ctx.fillRect(d.x, d.y, 2, d.h);
+    }
+  }
+}
+
 function renderBloodSplats() {
   for (const b of G.bloodSplats) {
     ctx.fillStyle = '#5a0d18';
@@ -1678,12 +1863,21 @@ function renderEntities() {
   entities.sort((a, b) => a.y - b.y);
 
   for (const e of entities) {
+    // LOS occlusion: only see things in line of sight from local player (skip during meeting).
+    if (G.player && e !== G.player && !G.meeting) {
+      if (!lineOfSight(G.player.x, G.player.y, e.x, e.y)) continue;
+    }
+    // Override color per role.
+    const displayColor = displayColorFor(e);
+    const original = e.color;
+    e.color = displayColor;
     if (e.type === 'remote' && e.alive === false) {
       drawCrewmateBody(e.x, e.y, e.color, e.facing, 0, false, true, false);
     } else {
       drawCrewmate(e);
       if (e.type === 'remote' && e.name) drawNameTag(e);
     }
+    e.color = original;
   }
 
   // dead player visual (if killed)
@@ -1693,6 +1887,19 @@ function renderEntities() {
     drawCrewmateBody(G.killedAt.x, G.killedAt.y, G.player.color, 1, 0, false, true);
     ctx.restore();
   }
+}
+
+// In MP, everyone is rendered blue EXCEPT the local player if they're the
+// impostor — they see themselves red. Single-player keeps the original
+// per-entity colors so the NPC variety stays.
+const CREWMATE_BLUE = '#3a7fd6';
+const IMPOSTOR_RED  = '#e74c3c';
+function displayColorFor(e) {
+  if (!MP.enabled) return e.color;
+  if (e.type === 'player') {
+    return MP.role === 'impostor' ? IMPOSTOR_RED : CREWMATE_BLUE;
+  }
+  return CREWMATE_BLUE;
 }
 
 function drawCrewmate(e) {
@@ -1946,34 +2153,50 @@ function buildHUD() {
     li.innerHTML = `<span class="checkbox"></span>${t.name}`;
     list.appendChild(li);
   }
+  // The old HUD meeting button is replaced by an in-world button rendered
+  // at MEETING_BUTTON. Keep the DOM element hidden permanently.
   const mBtn = document.getElementById('meetingBtn');
-  if (mBtn) {
-    if (!MP.enabled) {
-      mBtn.style.display = 'none';
-    } else {
-      mBtn.style.display = '';
-      mBtn.onclick = () => {
-        tryCallMeeting();
-        if (MP.meetingUsed === undefined) MP.meetingUsed = false;
-      };
-    }
-  }
+  if (mBtn) mBtn.style.display = 'none';
 }
 
-function updateMeetingButton() {
-  const btn = document.getElementById('meetingBtn');
-  if (!btn) return;
-  if (!MP.enabled || !G.player || !G.player.alive || G.phase !== 'playing') {
-    btn.classList.remove('spent');
-    btn.disabled = true;
-    return;
+function updateMeetingButton() { /* no-op — using in-world button now */ }
+
+// Sabotage panel — visible only to the impostor.
+let _sabHooked = false;
+function updateSabotagePanel() {
+  const panel = document.getElementById('sabotagePanel');
+  if (!panel) return;
+  const visible = MP.enabled && MP.role === 'impostor' && G.phase === 'playing' && G.player && G.player.alive;
+  panel.style.display = visible ? 'flex' : 'none';
+  if (!visible) return;
+
+  if (!_sabHooked) {
+    panel.querySelectorAll('.sab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const type = btn.dataset.type;
+        if (!type) return;
+        if (G.sabotages[type] > performance.now()) return;
+        MP.socket.emit('sabotage', { type });
+      });
+    });
+    _sabHooked = true;
   }
-  if (G.meeting || MP.meetingUsed) {
-    btn.classList.add('spent');
-    btn.disabled = true;
-  } else {
-    btn.classList.remove('spent');
-    btn.disabled = false;
+
+  const now = performance.now();
+  for (const type of ['lights', 'doors']) {
+    const btn = panel.querySelector(`.sab-btn[data-type="${type}"]`);
+    const status = panel.querySelector(`.sab-status[data-status="${type}"]`);
+    if (!btn || !status) continue;
+    const remaining = G.sabotages[type] - now;
+    if (remaining > 0) {
+      btn.classList.add('active');
+      btn.disabled = true;
+      status.textContent = (remaining / 1000).toFixed(1) + 's';
+    } else {
+      btn.classList.remove('active');
+      btn.disabled = false;
+      status.textContent = 'READY';
+    }
   }
 }
 

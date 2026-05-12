@@ -32,6 +32,8 @@ const io     = new Server(server, { cors: { origin: '*' } });
 // relative "style.css" / "app.js" against the URL it's currently on).
 app.get(['/app.js',    '/r/app.js'],    (req, res) => res.sendFile(path.join(ROOT, 'app.js')));
 app.get(['/style.css', '/r/style.css'], (req, res) => res.sendFile(path.join(ROOT, 'style.css')));
+app.use('/SFX',   express.static(path.join(ROOT, 'SFX')));
+app.use('/r/SFX', express.static(path.join(ROOT, 'SFX')));
 
 function generateRoomCode() {
   // 4 chars, omit ambiguous ones (0/O, 1/I, etc.)
@@ -104,6 +106,8 @@ function makeRoom(code) {
     impostorId: null,             // socket.id of the impostor for this round
     hostId:     null,             // socket.id of the host (first player; transfers on disconnect)
     meeting:    null,             // null or { calledBy, votes, startedAt, duration, timer }
+    sabotages:  { lights: 0, doors: 0 },  // expiry timestamps (Date.now ms)
+    sabotageTimers: { lights: null, doors: null },
   };
 }
 
@@ -142,6 +146,11 @@ function resetGame(room) {
   room.phase = 'playing';
   if (room.meeting && room.meeting.timer) clearTimeout(room.meeting.timer);
   room.meeting = null;
+  for (const k of ['lights', 'doors']) {
+    if (room.sabotageTimers[k]) clearTimeout(room.sabotageTimers[k]);
+    room.sabotageTimers[k] = null;
+    room.sabotages[k] = 0;
+  }
   for (const p of Object.values(room.players)) {
     p.alive = true;
     p.lastKill = 0;
@@ -350,6 +359,42 @@ io.on('connection', (socket) => {
     if ((me.meetingsUsed || 0) >= MEETINGS_PER_PLAYER) return;
     me.meetingsUsed = (me.meetingsUsed || 0) + 1;
     startMeeting(room, socket.id);
+  });
+
+  // ── Report a dead body (anyone alive standing next to one) ─
+  socket.on('report_body', ({ victimId }) => {
+    if (room.phase !== 'playing') return;
+    if (room.meeting) return;
+    const me = room.players[socket.id];
+    if (!me || !me.alive) return;
+    if (!victimId) return;
+    const victim = room.players[victimId];
+    if (!victim || victim.alive) return;
+    if (Math.hypot(me.x - victim.x, me.y - victim.y) > 110) return;
+    // Body-report is "free" — does NOT consume the reporter's meeting count.
+    startMeeting(room, socket.id);
+  });
+
+  // ── Sabotage (impostor only) ──────────────────────────────
+  socket.on('sabotage', ({ type }) => {
+    if (room.phase !== 'playing') return;
+    if (socket.id !== room.impostorId) return;
+    if (room.meeting) return;
+    const me = room.players[socket.id];
+    if (!me || !me.alive) return;
+    if (type !== 'lights' && type !== 'doors') return;
+    const now = Date.now();
+    if (room.sabotages[type] > now) return;        // already active
+    const duration = type === 'lights' ? 25000 : 15000;
+    room.sabotages[type] = now + duration;
+    io.to(code).emit('sabotage_start', { type, duration });
+    if (room.sabotageTimers[type]) clearTimeout(room.sabotageTimers[type]);
+    room.sabotageTimers[type] = setTimeout(() => {
+      room.sabotages[type] = 0;
+      room.sabotageTimers[type] = null;
+      io.to(code).emit('sabotage_end', { type });
+    }, duration);
+    console.log(`[room ${code}] sabotage: ${type} (${duration}ms)`);
   });
 
   socket.on('vote', ({ target }) => {

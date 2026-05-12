@@ -78,10 +78,11 @@ const TASK_IDS = [
   'wires_eng', 'calib_bridge', 'reactor', 'numpad_med', 'wires_comm', 'calib_sec',
 ];
 
-const KILL_RANGE       = 70;        // px, server-validated kill distance
-const KILL_COOLDOWN_MS = 25000;     // 25s between impostor kills
-const MEETING_DURATION = 30000;     // 30s voting window
+const KILL_RANGE          = 70;     // px, server-validated kill distance
+const KILL_COOLDOWN_MS    = 25000;  // 25s between impostor kills
+const MEETING_DURATION    = 30000;  // 30s voting window
 const MEETINGS_PER_PLAYER = 1;      // emergency meetings per player per round
+const SABOTAGE_COOLDOWN_MS = 30000; // 30s cooldown after a sabotage is fixed
 
 // Detect LAN IPs once at startup so we can send them to clients for "share link"
 // generation (so localhost users get a URL their friends can actually reach).
@@ -106,8 +107,8 @@ function makeRoom(code) {
     impostorId: null,             // socket.id of the impostor for this round
     hostId:     null,             // socket.id of the host (first player; transfers on disconnect)
     meeting:    null,             // null or { calledBy, votes, startedAt, duration, timer }
-    sabotages:  { lights: 0, doors: 0 },  // expiry timestamps (Date.now ms)
-    sabotageTimers: { lights: null, doors: null },
+    sabotages:  { lights: false, doors: false },  // active booleans
+    lastSabotageEnd: 0,           // Date.now() when last sabotage was fixed
   };
 }
 
@@ -146,11 +147,9 @@ function resetGame(room) {
   room.phase = 'playing';
   if (room.meeting && room.meeting.timer) clearTimeout(room.meeting.timer);
   room.meeting = null;
-  for (const k of ['lights', 'doors']) {
-    if (room.sabotageTimers[k]) clearTimeout(room.sabotageTimers[k]);
-    room.sabotageTimers[k] = null;
-    room.sabotages[k] = 0;
-  }
+  room.sabotages.lights = false;
+  room.sabotages.doors  = false;
+  room.lastSabotageEnd  = 0;
   for (const p of Object.values(room.players)) {
     p.alive = true;
     p.lastKill = 0;
@@ -383,18 +382,27 @@ io.on('connection', (socket) => {
     const me = room.players[socket.id];
     if (!me || !me.alive) return;
     if (type !== 'lights' && type !== 'doors') return;
-    const now = Date.now();
-    if (room.sabotages[type] > now) return;        // already active
-    const duration = type === 'lights' ? 25000 : 15000;
-    room.sabotages[type] = now + duration;
-    io.to(code).emit('sabotage_start', { type, duration });
-    if (room.sabotageTimers[type]) clearTimeout(room.sabotageTimers[type]);
-    room.sabotageTimers[type] = setTimeout(() => {
-      room.sabotages[type] = 0;
-      room.sabotageTimers[type] = null;
-      io.to(code).emit('sabotage_end', { type });
-    }, duration);
-    console.log(`[room ${code}] sabotage: ${type} (${duration}ms)`);
+    // Only one sabotage active at a time.
+    if (room.sabotages.lights || room.sabotages.doors) return;
+    // 30s cooldown after last fix.
+    if (room.lastSabotageEnd > 0 && Date.now() - room.lastSabotageEnd < SABOTAGE_COOLDOWN_MS) return;
+    room.sabotages[type] = true;
+    io.to(code).emit('sabotage_start', { type });
+    console.log(`[room ${code}] sabotage: ${type} (lasts until fixed)`);
+  });
+
+  // ── Fix sabotage (any alive crewmate at the battery console) ─
+  socket.on('fix_sabotage', () => {
+    if (room.phase !== 'playing') return;
+    if (room.meeting) return;
+    const me = room.players[socket.id];
+    if (!me || !me.alive) return;
+    const activeType = room.sabotages.lights ? 'lights' : room.sabotages.doors ? 'doors' : null;
+    if (!activeType) return;
+    room.sabotages[activeType] = false;
+    room.lastSabotageEnd = Date.now();
+    io.to(code).emit('sabotage_end', { type: activeType });
+    console.log(`[room ${code}] sabotage fixed: ${activeType} by ${socket.id.slice(0,4)}`);
   });
 
   socket.on('vote', ({ target }) => {

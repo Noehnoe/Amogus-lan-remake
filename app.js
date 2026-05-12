@@ -146,6 +146,9 @@ const DOORS = _map.doors;
 // Position of the in-world emergency-meeting button (center of cafeteria).
 const MEETING_BUTTON = { x: 1000, y: 510, r: 28 };
 
+// Emergency Backup Battery — crewmates interact here to end any active sabotage.
+const BATTERY_CONSOLE = { x: 1000, y: 620, r: 22 };
+
 // Vents — placed in room corners so impostor can escape stealthily.
 // Linked pairs: 0↔1 (engineering↔reactor), 2↔3 (medbay↔security),
 //               4↔5 (bridge↔storage),     6↔7 (cafeteria↔comms).
@@ -189,6 +192,8 @@ const MP = {
   killCooldown: 0,           // local-only display value (server is authoritative)
   KILL_RANGE: 70,
   KILL_COOLDOWN: 25,
+  sabotageEndedAt: 0,        // performance.now() when last sabotage was fixed (for 30s cooldown display)
+  SABOTAGE_COOLDOWN: 30,
 };
 
 function getRoomCodeFromURL() {
@@ -342,25 +347,22 @@ function initMultiplayer() {
   });
 
   // ── Sabotage (impostor calls; everyone sees the effect) ─
-  MP.socket.on('sabotage_start', ({ type, duration }) => {
-    const endsAt = performance.now() + duration;
-    G.sabotages[type] = endsAt;
+  MP.socket.on('sabotage_start', ({ type }) => {
+    G.sabotages[type] = true;
     if (type === 'lights') {
-      G.ambient.lightsOut = true;
-      G.ambient.lightsOutT = duration / 1000;
+      // Lights sabotage: force flashlight off. F key is blocked until fixed.
+      G.vision.active = false;
     }
+    MP.sabotageEndedAt = 0;
     SFX.alarm();
     flashScreen('red');
     G.cam.shake = 10;
   });
 
   MP.socket.on('sabotage_end', ({ type }) => {
-    G.sabotages[type] = 0;
-    if (type === 'lights') {
-      G.ambient.lightsOut = false;
-      G.ambient.lightsOutT = 0;
-      flashScreen('white');
-    }
+    G.sabotages[type] = false;
+    MP.sabotageEndedAt = performance.now();
+    flashScreen('white');
   });
 
   MP.socket.on('killed', ({ victimId, x, y }) => {
@@ -739,15 +741,12 @@ const G = {
   pendingMenuTimeout: null,
   meeting: null,             // active meeting state: { calledBy, players, votes, myVote, startedAt, duration }
   bodies: [],                // [{ playerId, x, y }] reported-able corpses
-  sabotages: { lights: 0, doors: 0 },  // expiry timestamps (ms via performance.now)
+  sabotages: { lights: false, doors: false },  // active booleans — cleared by fix_sabotage
 };
 
 // Current solid set — walls always, doors only when door-sabotage is active.
 function solids() {
-  if (G.sabotages.doors > performance.now()) {
-    return WALLS.concat(DOORS);
-  }
-  return WALLS;
+  return G.sabotages.doors ? WALLS.concat(DOORS) : WALLS;
 }
 
 // Schedule the post-game menu to appear after `delay` ms. If a new round
@@ -776,7 +775,9 @@ window.addEventListener('keydown', e => {
   if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
   keys[e.key.toLowerCase()] = true;
   if (e.key === 'e' || e.key === 'E') tryInteract();
-  if (e.key === 'f' || e.key === 'F') G.vision.active = !G.vision.active;
+  if (e.key === 'f' || e.key === 'F') {
+    if (!G.sabotages.lights) G.vision.active = !G.vision.active;
+  }
   if (e.key === 'q' || e.key === 'Q') tryKill();
   if (e.key === 'r' || e.key === 'R') tryReportOrMeeting();
 });
@@ -966,6 +967,7 @@ function initGame() {
     for (const r of MP.remotes.values()) r.alive = true;
     MP.killCooldown = 0;
     MP.meetingUsed = false;
+    MP.sabotageEndedAt = 0;
     G.meeting = null;
     document.getElementById('meetingOverlay')?.classList.add('hidden');
     document.getElementById('ejectionOverlay')?.classList.add('hidden');
@@ -979,7 +981,7 @@ function initGame() {
   G.ambient.lightsOutT = 0;
   G.threatLevel = 0;
   G.killedAt = null;
-  G.sabotages = { lights: 0, doors: 0 };
+  G.sabotages = { lights: false, doors: false };
 
   // Background stars
   G.stars = [];
@@ -1396,8 +1398,8 @@ function updateAmbient(dt) {
       G.ambient.lightsOut = false;
       flashScreen('white');
     }
-  } else if (Math.random() < dt * 0.012) {
-    // rare sabotage event — lights flicker out briefly (no impostor input needed in solo)
+  } else if (!MP.enabled && Math.random() < dt * 0.012) {
+    // solo-only: rare random lights flicker based on threat level
     if (G.threatLevel > 0.5) {
       G.ambient.lightsOut = true;
       G.ambient.lightsOutT = 6;
@@ -1426,6 +1428,16 @@ function updateInteractionPrompt() {
     if (body) {
       setPrompt(`PRESS [R] — REPORT BODY (${body.name || '???'})`, true);
       return;
+    }
+    // Battery console — crewmate only, when a sabotage is active.
+    const anyActive = G.sabotages.lights || G.sabotages.doors;
+    if (anyActive && MP.role !== 'impostor') {
+      const bc = BATTERY_CONSOLE;
+      if (Math.hypot(bc.x - G.player.x, bc.y - G.player.y) < 60) {
+        const which = G.sabotages.lights ? 'LIGHTS' : 'DOORS';
+        setPrompt(`PRESS [E] — FIX ${which} SABOTAGE`, true);
+        return;
+      }
     }
     // Meeting button (proximity).
     if (nearMeetingButton()) {
@@ -1548,6 +1560,7 @@ function render() {
   renderVents();
   renderTasks();
   renderMeetingButton();
+  renderBatteryConsole();
   renderBloodSplats();
   renderWalls();
   renderClosedDoors();
@@ -1792,15 +1805,62 @@ function renderMeetingButton() {
   ctx.fillText('EMERGENCY', mb.x, mb.y + mb.r + 16);
 }
 
+function renderBatteryConsole() {
+  const anyActive = G.sabotages.lights || G.sabotages.doors;
+  const bc = BATTERY_CONSOLE;
+  const pulse = (Math.sin(G.pulseT * 4) + 1) / 2;
+
+  // Always render a dim console; glow + label only when a sabotage is active.
+  const glowAlpha = anyActive ? 0.55 + pulse * 0.35 : 0.15;
+  const glowColor = anyActive ? `rgba(255, 200, 50, ${glowAlpha})` : `rgba(80,80,80,0.2)`;
+  const g = ctx.createRadialGradient(bc.x, bc.y, 0, bc.x, bc.y, 70);
+  g.addColorStop(0, glowColor);
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(bc.x - 70, bc.y - 70, 140, 140);
+
+  // Housing.
+  ctx.fillStyle = '#1a1a2e';
+  ctx.beginPath();
+  ctx.arc(bc.x, bc.y, bc.r + 6, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = anyActive ? `rgba(255,200,50,${0.7 + pulse * 0.3})` : '#333';
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+
+  // Face.
+  const face = ctx.createRadialGradient(bc.x - 4, bc.y - 4, 0, bc.x, bc.y, bc.r);
+  if (anyActive) {
+    face.addColorStop(0, '#ffe066'); face.addColorStop(1, '#b87700');
+  } else {
+    face.addColorStop(0, '#444'); face.addColorStop(1, '#222');
+  }
+  ctx.fillStyle = face;
+  ctx.beginPath();
+  ctx.arc(bc.x, bc.y, bc.r, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Lightning bolt icon.
+  ctx.fillStyle = anyActive ? '#1a1a2e' : '#555';
+  ctx.font = 'bold 22px Courier New';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('⚡', bc.x, bc.y + 1);
+
+  // Label — only shown when active.
+  if (anyActive) {
+    ctx.font = 'bold 10px Courier New';
+    ctx.fillStyle = `rgba(255,200,50,${0.8 + pulse * 0.2})`;
+    ctx.fillText('BACKUP BATTERY', bc.x, bc.y + bc.r + 15);
+  }
+}
+
 function renderClosedDoors() {
-  if (G.sabotages.doors <= performance.now()) return;
-  const remaining = (G.sabotages.doors - performance.now()) / 1000;
-  const flash = Math.sin(performance.now() / 100) > 0;
+  if (!G.sabotages.doors) return;
+  const flash = Math.sin(performance.now() / 150) > 0;
   for (const d of DOORS) {
-    // Solid red bar with optional yellow safety stripes when about to lift.
-    ctx.fillStyle = remaining < 3 && flash ? '#ff6b30' : '#cc1a2a';
+    ctx.fillStyle = flash ? '#cc1a2a' : '#a01020';
     ctx.fillRect(d.x, d.y, d.w, d.h);
-    // Highlight edge.
     ctx.fillStyle = '#ff4d5a';
     if (d.h === 8) {
       ctx.fillRect(d.x, d.y, d.w, 2);
@@ -2175,23 +2235,40 @@ function updateSabotagePanel() {
       btn.addEventListener('click', () => {
         const type = btn.dataset.type;
         if (!type) return;
-        if (G.sabotages[type] > performance.now()) return;
+        if (G.sabotages.lights || G.sabotages.doors) return;     // one at a time
+        const cooldownLeft = MP.SABOTAGE_COOLDOWN - (performance.now() - MP.sabotageEndedAt) / 1000;
+        if (MP.sabotageEndedAt > 0 && cooldownLeft > 0) return;  // cooldown active
         MP.socket.emit('sabotage', { type });
       });
     });
     _sabHooked = true;
   }
 
-  const now = performance.now();
+  const anyActive = G.sabotages.lights || G.sabotages.doors;
+  const cooldownLeft = MP.sabotageEndedAt > 0
+    ? Math.max(0, MP.SABOTAGE_COOLDOWN - (performance.now() - MP.sabotageEndedAt) / 1000)
+    : 0;
+
   for (const type of ['lights', 'doors']) {
     const btn = panel.querySelector(`.sab-btn[data-type="${type}"]`);
     const status = panel.querySelector(`.sab-status[data-status="${type}"]`);
     if (!btn || !status) continue;
-    const remaining = G.sabotages[type] - now;
-    if (remaining > 0) {
+
+    if (G.sabotages[type]) {
+      // This sabotage is currently active — waiting for crew to fix.
       btn.classList.add('active');
       btn.disabled = true;
-      status.textContent = (remaining / 1000).toFixed(1) + 's';
+      status.textContent = 'ACTIVE';
+    } else if (anyActive) {
+      // Other sabotage is active — can't stack.
+      btn.classList.remove('active');
+      btn.disabled = true;
+      status.textContent = 'BUSY';
+    } else if (cooldownLeft > 0) {
+      // Post-fix cooldown.
+      btn.classList.remove('active');
+      btn.disabled = true;
+      status.textContent = cooldownLeft.toFixed(1) + 's';
     } else {
       btn.classList.remove('active');
       btn.disabled = false;
@@ -2295,6 +2372,17 @@ function tryInteract() {
   if (G.meeting) return;
   if (G.activeTask) return;
   if (!G.player.alive) return;
+
+  // Battery console — crewmates only, fixes any active sabotage.
+  const anyActive = G.sabotages.lights || G.sabotages.doors;
+  if (anyActive && MP.enabled && MP.role !== 'impostor') {
+    const bc = BATTERY_CONSOLE;
+    if (Math.hypot(bc.x - G.player.x, bc.y - G.player.y) < 60) {
+      MP.socket.emit('fix_sabotage');
+      return;
+    }
+  }
+
   if (MP.enabled && MP.role === 'impostor') return;   // impostors can't do tasks
   // find nearest task in range
   let near = null, bd = CFG.TASK_RANGE;
